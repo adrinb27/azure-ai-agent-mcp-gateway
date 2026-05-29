@@ -1,0 +1,31 @@
+# ── Secrets — NEVER commit these ─────────────────────────────────────────────
+.env
+*.env.local
+*.env.*.local
+
+# ── Azure developer CLI ───────────────────────────────────────────────────────
+.azure/
+!.azure/deployment-plan.md
+
+# ── Build outputs ─────────────────────────────────────────────────────────────
+dist/
+build/
+*.js.map
+infra/main.json
+
+# ── Deployment / session artifacts (temp files created by scripts) ────────────
+.apim-policy-*.json
+.deploy-*.txt
+.validation-proof.log
+
+# ── Node ──────────────────────────────────────────────────────────────────────
+node_modules/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+.venv/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

@@ -1,0 +1,160 @@
+<policies>
+    <inbound>
+        <base />
+        <!-- 0. Handle OAuth protected resource discovery (no auth required) -->
+        <choose>
+            <when condition="@((context.Request.Url.Path ?? string.Empty).Contains(&quot;well-known/oauth-protected-resource&quot;))">
+                <return-response>
+                    <set-status code="200" reason="OK" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>@{
+                        var host = context.Request.OriginalUrl.Host;
+                        var scheme = context.Request.OriginalUrl.Scheme;
+                        var port = context.Request.OriginalUrl.Port;
+                        var baseUrl = scheme + "://" + host;
+                        if ((scheme == "https" &amp;&amp; port != 443) || (scheme == "http" &amp;&amp; port != 80)) {
+                            baseUrl += ":" + port.ToString();
+                        }
+                        return "{\"resource\":\"" + baseUrl + "\",\"authorization_servers\":[\"https://login.microsoftonline.com/APIM_TENANT_ID/v2.0\"],\"scopes_supported\":[\"api://APIM_GATEWAY_APP_ID/.default\"],\"bearer_methods_supported\":[\"header\"],\"resource_documentation\":\"https://github.com/Microsoft/mcp\"}";
+                    }</set-body>
+                </return-response>
+            </when>
+        </choose>
+        <!-- 1. Validate incoming Entra ID token (audience = APIM Gateway app)
+             Uses the purpose-built validate-azure-ad-token policy (recommended over validate-jwt for Entra).
+             <audiences> sets the expected token audience (api://96537248...).
+             Any valid Entra caller that holds a token for this resource is accepted.
+             Stores the validated JWT in 'validated-token' for claim extraction below. -->
+        <validate-azure-ad-token tenant-id="APIM_TENANT_ID" header-name="Authorization" failed-validation-httpcode="401" failed-validation-error-message="Unauthorized. Access token is missing or invalid." output-token-variable-name="validated-token">
+            <audiences>
+                <audience>api://APIM_GATEWAY_APP_ID</audience>
+                <audience>APIM_GATEWAY_APP_ID</audience>
+            </audiences>
+        </validate-azure-ad-token>
+        <!-- 2. Extract user identity from the validated token variable (avoids re-parsing the raw header) -->
+        <set-variable name="user-oid" value="@(((Jwt)context.Variables[&quot;validated-token&quot;]).Claims.GetValueOrDefault(&quot;oid&quot;, &quot;unknown&quot;))" />
+        <set-variable name="user-name" value="@(((Jwt)context.Variables[&quot;validated-token&quot;]).Claims.GetValueOrDefault(&quot;name&quot;, ((Jwt)context.Variables[&quot;validated-token&quot;]).Claims.GetValueOrDefault(&quot;preferred_username&quot;, &quot;unknown&quot;)))" />
+        <set-variable name="user-upn" value="@(((Jwt)context.Variables[&quot;validated-token&quot;]).Claims.GetValueOrDefault(&quot;preferred_username&quot;, &quot;unknown&quot;))" />
+        <set-variable name="user-groups" value="@(((Jwt)context.Variables[&quot;validated-token&quot;]).Claims.GetValueOrDefault(&quot;groups&quot;, &quot;&quot;))" />
+        <!-- 3. Acquire backend token for the MCP CA using token exchange via the v2 endpoint.
+             We use two sub-flows based on whether the incoming token is delegated (user context)
+             or app-only (pure M2M / daemon).
+             Detection: in Entra v2 tokens, app-only tokens always have sub == oid (the SP object ID).
+             User tokens always have a pairwise-pseudonymous sub that differs from oid.
+             We prefer this over checking 'idtyp' because some issuers (IMDS, Foundry MI) omit
+             the idtyp claim even for app-only tokens.
+               - Delegated / user token (sub != oid) → On-Behalf-Of (OBO): jwt-bearer grant type.
+                 The resulting token carries the caller's identity and their assigned roles.
+                 Callers need 'Mcp.Tools.ReadWrite' assigned on the MCP CA app registration.
+               - App-only token (sub == oid) → Client Credentials: the APIM Gateway App
+                 (obo-client-id) calls the MCP CA with its own identity.
+                 The APIM app SP needs 'Mcp.Tools.ReadWrite.All' on MCP CA SP.
+             Both paths call the v2 token endpoint, which honours requestedAccessTokenVersion:2
+             on the MCP CA app registration and produces v2 tokens with proper 'roles' claims. -->
+        <choose>
+            <!-- 3a. OBO flow for delegated / user tokens (sub != oid → user token) -->
+            <when condition="@{
+                var jwt = (Jwt)context.Variables[&quot;validated-token&quot;];
+                var sub = jwt.Claims.GetValueOrDefault(&quot;sub&quot;, &quot;&quot;);
+                var oid = jwt.Claims.GetValueOrDefault(&quot;oid&quot;, &quot;&quot;);
+                return !string.IsNullOrEmpty(sub) &amp;&amp; sub != oid;
+            }">
+                <send-request mode="new" response-variable-name="backend-token-response" timeout="30" ignore-error="false">
+                    <set-url>https://login.microsoftonline.com/APIM_TENANT_ID/oauth2/v2.0/token</set-url>
+                    <set-method>POST</set-method>
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/x-www-form-urlencoded</value>
+                    </set-header>
+                    <set-body>@{
+                        var rawToken = context.Request.Headers.GetValueOrDefault("Authorization","").Replace("Bearer ","");
+                        return "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer"
+                            + "&amp;assertion=" + rawToken
+                            + "&amp;client_id={{obo-client-id}}"
+                            + "&amp;client_secret={{obo-client-secret}}"
+                            + "&amp;scope=api://MCP_CA_APP_ID/.default"
+                            + "&amp;requested_token_use=on_behalf_of";
+                    }</set-body>
+                </send-request>
+            </when>
+            <!-- 3b. Client credentials flow for app-only (M2M) tokens -->
+            <otherwise>
+                <send-request mode="new" response-variable-name="backend-token-response" timeout="30" ignore-error="false">
+                    <set-url>https://login.microsoftonline.com/APIM_TENANT_ID/oauth2/v2.0/token</set-url>
+                    <set-method>POST</set-method>
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/x-www-form-urlencoded</value>
+                    </set-header>
+                    <set-body>@{
+                        return "grant_type=client_credentials"
+                            + "&amp;client_id={{obo-client-id}}"
+                            + "&amp;client_secret={{obo-client-secret}}"
+                            + "&amp;scope=api://MCP_CA_APP_ID/.default";
+                    }</set-body>
+                </send-request>
+            </otherwise>
+        </choose>
+        <!-- 3c. Capture backend token body before the stream is consumed -->
+        <set-variable name="backend-token-body" value="@(((IResponse)context.Variables[&quot;backend-token-response&quot;]).Body.As&lt;string&gt;(preserveContent: true))" />
+        <!-- 3d. Validate token exchange response -->
+        <choose>
+            <when condition="@(((IResponse)context.Variables[&quot;backend-token-response&quot;]).StatusCode != 200)">
+                <return-response>
+                    <set-status code="502" reason="Bad Gateway" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>{"error":"token_exchange_failed","message":"APIM could not obtain a backend token for the MCP server. Check named values obo-client-id/obo-client-secret and role assignments on the MCP CA app registration."}</set-body>
+                </return-response>
+            </when>
+        </choose>
+        <set-header name="Authorization" exists-action="override">
+            <value>@("Bearer " + (string)Newtonsoft.Json.Linq.JObject.Parse((string)context.Variables["backend-token-body"])["access_token"])</value>
+        </set-header>
+        <!-- 4. Inject VERIFIED user identity as trusted headers -->
+        <set-header name="X-User-OID" exists-action="override">
+            <value>@((string)context.Variables["user-oid"])</value>
+        </set-header>
+        <set-header name="X-User-Name" exists-action="override">
+            <value>@((string)context.Variables["user-name"])</value>
+        </set-header>
+        <set-header name="X-User-UPN" exists-action="override">
+            <value>@((string)context.Variables["user-upn"])</value>
+        </set-header>
+        <set-header name="X-User-Groups" exists-action="override">
+            <value>@((string)context.Variables["user-groups"])</value>
+        </set-header>
+        <set-header name="X-APIM-Gateway" exists-action="override">
+            <value>true</value>
+        </set-header>
+        <!-- 5. Per-user rate limiting -->
+        <rate-limit-by-key calls="100" renewal-period="60" counter-key="@((string)context.Variables[&quot;user-oid&quot;])" />
+        <!-- 6. Strip /mcp prefix — MCP server listens on / not /mcp -->
+        <rewrite-uri template="/" copy-unmatched-params="true" />
+        <!-- 7. Route to MCP backend -->
+        <set-backend-service backend-id="mcp-server" />
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+        <set-header name="X-Served-By" exists-action="override">
+            <value>apim-ai-gateway-hybrid</value>
+        </set-header>
+    </outbound>
+    <on-error>
+        <base />
+        <choose>
+            <when condition="@(context.Response.StatusCode == 401)">
+                <set-header name="WWW-Authenticate" exists-action="override">
+                    <value>@{
+                        var host = context.Request.OriginalUrl.Scheme + "://" + context.Request.OriginalUrl.Host;
+                        return "Bearer realm=\"" + context.Request.OriginalUrl.Host + "\", resource_metadata=\"" + host + "/mcp/.well-known/oauth-protected-resource\"";
+                    }</value>
+                </set-header>
+            </when>
+        </choose>
+    </on-error>
+</policies>
