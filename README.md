@@ -371,6 +371,17 @@ python3 test_agent_mcp.py --phase 3   # Run agent conversation
 
 ---
 
+## Governance Demo
+
+This repo includes a lightweight demo of Microsoft's open-source
+[Agent Governance Toolkit](https://github.com/microsoft/agent-governance-toolkit),
+showing policy-based allow/deny enforcement in front of the MCP tool calls
+above (`policies/governance-policy.yaml`, `demo_governance.py`, and
+`test_agent_mcp.py --governed`). See
+[`docs/governance-demo.md`](docs/governance-demo.md) for the full walkthrough.
+
+---
+
 ## Troubleshooting
 
 ### HTTP 500 "Internal server error" from APIM

@@ -1,0 +1,9 @@
+# requirements-governance.txt
+#
+# Dependency for the Agent Governance Toolkit (AGT) demo.
+# See docs/governance-demo.md for what this adds and how to run the demo.
+#
+# Install with:
+#   pip install -r requirements-governance.txt
+
+agent-governance-toolkit[full]

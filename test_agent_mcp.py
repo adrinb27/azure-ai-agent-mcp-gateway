@@ -49,6 +49,15 @@ from azure.ai.agents.models import (
     RunStepMcpToolCall,
 )
 
+# Agent Governance Toolkit (AGT) — optional, opt-in governance layer.
+# Only imported when actually needed (--governed / GOVERNANCE_ENABLED) so the
+# default (ungoverned) path has zero new dependency requirements.
+try:
+    from agentmesh.governance import govern, GovernanceDenied
+except ImportError:
+    govern = None
+    GovernanceDenied = Exception  # placeholder so `except GovernanceDenied` still parses
+
 
 def _require(var: str) -> str:
     val = os.environ.get(var, "")
@@ -89,6 +98,11 @@ AGENT_INSTRUCTIONS = (
     "Use MCP tools when the user asks about Azure resources, subscriptions, or services."
 )
 TEST_MESSAGE = "Using the MCP tools available to you, list the resource groups in the Azure subscription."
+
+# Governance (Agent Governance Toolkit demo — see docs/governance-demo.md).
+# Opt-in via --governed CLI flag (set in main()) or GOVERNANCE_ENABLED in .env.
+GOVERNANCE_ENABLED = os.environ.get("GOVERNANCE_ENABLED", "").strip().lower() in ("1", "true", "yes")
+GOVERNANCE_POLICY_FILE = os.path.join(os.path.dirname(__file__), "policies", "governance-policy.yaml")
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -98,6 +112,27 @@ def get_apim_token(credential) -> str:
     token = credential.get_token(APIM_TOKEN_SCOPE, tenant_id=TENANT_ID)
     print(f"  ✅ Token acquired (expires: {token.expires_on})")
     return token.token
+
+
+def _governed_mcp_call(request_fn, *args, **kwargs):
+    """
+    Optionally wrap an MCP request function with AGT governance.
+
+    When governance is disabled (default), calls request_fn unchanged — zero
+    behavior change from the pre-governance code path. When enabled, evaluates
+    the call against policies/governance-policy.yaml before it runs; a denied
+    call raises GovernanceDenied *before* any HTTP request is made.
+    """
+    if not GOVERNANCE_ENABLED:
+        return request_fn(*args, **kwargs)
+
+    if govern is None:
+        print("  ⚠️  GOVERNANCE_ENABLED is set but agent-governance-toolkit is not installed.")
+        print("     Run: pip install -r requirements-governance.txt")
+        raise SystemExit(1)
+
+    governed_fn = govern(request_fn, policy=GOVERNANCE_POLICY_FILE)
+    return governed_fn(*args, **kwargs)
 
 
 def phase1_test_apim_mcp(credential):
@@ -188,7 +223,22 @@ def phase1_test_apim_mcp(credential):
         headers["mcp-session-id"] = session_id
 
     payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
-    resp = requests.post(MCP_VIA_APIM_URL, json=payload, headers=headers, timeout=15)
+
+    def list_resource_groups():
+        # Named to match the "safe/read" side of policies/governance-policy.yaml
+        # (never matches the destructive-action deny rule, so it is always
+        # allowed — this is the real MCP call the --governed flag demonstrates).
+        return requests.post(MCP_VIA_APIM_URL, json=payload, headers=headers, timeout=15)
+
+    if GOVERNANCE_ENABLED:
+        print("     🛡️  Governance enabled — evaluating call against policy before sending...")
+        try:
+            resp = _governed_mcp_call(list_resource_groups)
+        except GovernanceDenied as exc:
+            print(f"     ⛔ Governance denied this call before it reached APIM: {exc}")
+            return False
+    else:
+        resp = list_resource_groups()
     print(f"     Status: {resp.status_code}")
 
     tools = []
@@ -369,16 +419,27 @@ def phase3_run_conversation(agents_client: AgentsClient, agent_id: str, credenti
 
 
 def main():
+    global GOVERNANCE_ENABLED
+
     parser = argparse.ArgumentParser(description="Test Agent → APIM → MCP flow")
     parser.add_argument("--phase", type=int, choices=[1, 2, 3], default=0,
                         help="Run a specific phase only (default: all)")
+    parser.add_argument("--governed", action="store_true",
+                        help="Wrap MCP tool calls with Agent Governance Toolkit "
+                             "(policies/governance-policy.yaml) before they reach APIM. "
+                             "Same effect as setting GOVERNANCE_ENABLED=true in .env. "
+                             "See docs/governance-demo.md.")
     args = parser.parse_args()
+
+    if args.governed:
+        GOVERNANCE_ENABLED = True
 
     print("Azure Agent → APIM → MCP end-to-end test")
     print(f"  APIM MCP URL : {MCP_VIA_APIM_URL or '(not set — add APIM_GATEWAY_URL to .env)'}")
     print(f"  Foundry proj : {PROJECT_NAME or '(not set)'}")
     print(f"  Agent name   : {AGENT_NAME}")
     print(f"  Model        : {AGENT_MODEL}")
+    print(f"  Governance   : {'enabled ✅' if GOVERNANCE_ENABLED else 'disabled (default)'}")
 
     if not MCP_VIA_APIM_URL:
         print("❌  APIM_GATEWAY_URL is not set in .env — required for all phases.")

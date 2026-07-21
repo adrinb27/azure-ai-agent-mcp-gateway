@@ -1,0 +1,25 @@
+# policies/governance-policy.yaml
+#
+# Agent Governance Toolkit (AGT) demo policy for this repo.
+# Schema: https://github.com/microsoft/agent-governance-toolkit (apiVersion: governance.toolkit/v1)
+#
+# Shared by BOTH demo surfaces:
+#   - demo_governance.py            (standalone, no Azure deployment required)
+#   - test_agent_mcp.py --governed  (real Foundry Agent -> APIM -> Azure MCP flow)
+#
+# Philosophy: default-allow, deny-by-exception. Every Azure MCP tool call is
+# allowed unless it matches a destructive action pattern below. This lets a
+# presenter show that safe/read actions (e.g. listing resource groups) flow
+# through untouched, while destructive actions (delete/drop/truncate) are
+# blocked *before* they ever reach Azure/APIM.
+
+apiVersion: governance.toolkit/v1
+name: azure-mcp-demo-policy
+default_action: allow
+
+rules:
+  - name: block-destructive-azure-actions
+    condition: "action.type in ['delete_resource_group', 'drop', 'delete', 'truncate']"
+    action: deny
+    description: "Destructive Azure operations are blocked in this demo"
+    priority: 100
