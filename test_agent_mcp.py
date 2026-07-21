@@ -224,16 +224,18 @@ def phase1_test_apim_mcp(credential):
 
     payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
 
-    def list_resource_groups():
+    def list_resource_groups(action="list_resource_groups"):
         # Named to match the "safe/read" side of policies/governance-policy.yaml
         # (never matches the destructive-action deny rule, so it is always
         # allowed — this is the real MCP call the --governed flag demonstrates).
+        # `action` is passed through so govern() can evaluate action.type
+        # (AGT derives policy context from the call's `action=` kwarg).
         return requests.post(MCP_VIA_APIM_URL, json=payload, headers=headers, timeout=15)
 
     if GOVERNANCE_ENABLED:
         print("     🛡️  Governance enabled — evaluating call against policy before sending...")
         try:
-            resp = _governed_mcp_call(list_resource_groups)
+            resp = _governed_mcp_call(list_resource_groups, action="list_resource_groups")
         except GovernanceDenied as exc:
             print(f"     ⛔ Governance denied this call before it reached APIM: {exc}")
             return False

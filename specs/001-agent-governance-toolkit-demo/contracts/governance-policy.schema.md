@@ -10,6 +10,7 @@ lintable/verifiable with AGT's own CLI (`agt lint-policy`, `agt verify`).
 ```yaml
 apiVersion: governance.toolkit/v1   # required, fixed literal
 name: <string>                      # required, policy identifier
+version: <string>                   # required by `agt lint-policy` (e.g. "1.0")
 default_action: allow | deny        # required — this demo MUST use "allow"
 rules:                              # required, list, >= 1 item
   - name: <string>                  # required, unique per policy
@@ -24,6 +25,7 @@ rules:                              # required, list, >= 1 item
 ```yaml
 apiVersion: governance.toolkit/v1
 name: azure-mcp-demo-policy
+version: "1.0"
 default_action: allow
 rules:
   - name: block-destructive-azure-actions
@@ -42,8 +44,29 @@ rules:
 | `agt lint-policy policies/` | Validates the YAML conforms to the schema above (User Story 3) |
 | `agt verify` | Confirms overall governance coverage / OWASP-style compliance reporting against this policy (User Story 3) |
 
+## Runtime contract: how `action.type` is populated (verified against AGT 4.1.0)
+
+`govern()` does **not** infer `action.type` from the wrapped function's name.
+It reads the evaluation context from the **call site's own `action=` keyword
+argument** — the governed function must accept (and be called with) an
+`action` parameter whose value matches a `condition` in the policy, e.g.:
+
+```python
+safe_delete = govern(delete_resource_group, policy="policies/governance-policy.yaml")
+safe_delete(action="delete_resource_group", name="rg-demo")   # -> DENY
+safe_list  = govern(list_resource_groups, policy="policies/governance-policy.yaml")
+safe_list(action="list_resource_groups")                      # -> ALLOW
+```
+
+Both `demo_governance.py` and `test_agent_mcp.py`'s `_governed_mcp_call`
+helper follow this convention. This was verified end-to-end against a real
+`agent-governance-toolkit[full]==4.1.0` install (see `docs/governance-demo.md`
+for the verified run transcript).
+
 ## Compatibility / change rules
 
 - Adding a new rule MUST include `name`, `condition`, `action`, `description` (all required fields above) — a rule missing any of these is expected to fail `agt lint-policy`.
+- The policy file MUST include a top-level `version` field — `agt lint-policy` fails with `Missing required field 'version'` otherwise (verified).
 - `default_action` MUST remain `allow` for this demo's narrative (default-allow, deny-by-exception) — changing it to `deny` would require every demoed action to have an explicit `allow` rule, which is out of scope here.
 - The two demo call sites (`demo_governance.py` and `test_agent_mcp.py`) MUST reference the same policy file path (no forked copies), so a single edit changes behavior everywhere — this is what FR-002's "self-explanatory, single policy" intent (and the plan's "single shared policy" research decision) requires.
+- Any governed function/call site MUST pass an explicit `action=` keyword argument matching the `action.type` value referenced in policy conditions — `govern()` has no other way to know what action is being attempted.

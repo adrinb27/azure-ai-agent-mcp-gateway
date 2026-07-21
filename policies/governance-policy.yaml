@@ -15,6 +15,7 @@
 
 apiVersion: governance.toolkit/v1
 name: azure-mcp-demo-policy
+version: "1.0"
 default_action: allow
 
 rules:

@@ -32,7 +32,7 @@ if os.path.isfile(_env_path):
 POLICY_FILE = os.path.join(os.path.dirname(__file__), "policies", "governance-policy.yaml")
 
 
-def list_resource_groups() -> dict:
+def list_resource_groups(action: str = "list_resource_groups") -> dict:
     """
     ALLOW example: a real Azure MCP tool call (list resource groups) through
     the deployed APIM gateway, using the same JSON-RPC pattern as
@@ -41,9 +41,6 @@ def list_resource_groups() -> dict:
     not set, this call is skipped with a clear message so the rest of the
     demo (the DENY path) still runs standalone.
     """
-    import requests
-    from azure.identity import AzureCliCredential
-
     apim_url = os.environ.get("APIM_GATEWAY_URL", "")
     apim_app_id = os.environ.get("APIM_GATEWAY_APP_ID", "")
     tenant_id = os.environ.get("AZURE_TENANT_ID", "")
@@ -53,6 +50,11 @@ def list_resource_groups() -> dict:
             "reason": "APIM_GATEWAY_URL / APIM_GATEWAY_APP_ID / AZURE_TENANT_ID not set in .env "
                       "— skipping the real Azure MCP call; the deny path below still works standalone.",
         }
+
+    # Imported lazily so the demo still runs (and gracefully skips, above) even
+    # if requests/azure-identity aren't installed and .env isn't configured yet.
+    import requests
+    from azure.identity import AzureCliCredential
 
     credential = AzureCliCredential(tenant_id=tenant_id)
     token = credential.get_token(f"api://{apim_app_id}/.default", tenant_id=tenant_id).token
@@ -66,12 +68,16 @@ def list_resource_groups() -> dict:
     return {"status_code": resp.status_code, "body": resp.text[:500]}
 
 
-def delete_resource_group(name: str) -> dict:
+def delete_resource_group(action: str, name: str) -> dict:
     """
     DENY example: a safe local stub representing a destructive Azure action.
     Deliberately makes NO network/Azure call — the standard Azure MCP server
     surface does not expose a generic destructive "delete resource group"
     tool, so this stub proves AGT's enforcement mechanics without any risk.
+
+    ``action`` is required so govern() can evaluate it against the policy's
+    `action.type` condition (AGT derives the policy context from the
+    call's `action=` kwarg, not the function name).
     """
     return {"would_delete": name}
 
@@ -85,12 +91,12 @@ def main() -> int:
     print("=" * 60)
 
     print("\n[ALLOW] Calling governed list_resource_groups()...")
-    result = safe_list()
+    result = safe_list(action="list_resource_groups")
     print(f"  \u2705 Allowed. Result: {json.dumps(result, indent=2)}")
 
     print("\n[DENY] Calling governed delete_resource_group('rg-demo')...")
     try:
-        safe_delete(name="rg-demo")
+        safe_delete(action="delete_resource_group", name="rg-demo")
         print("  \u274c Unexpected: call was NOT denied (check policy file).")
         return 1
     except GovernanceDenied as exc:
