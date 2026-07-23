@@ -17,6 +17,8 @@ param searchId string
 param storageAccountId string
 param aiServicesId string
 param azureSpObjectId string = ''
+param acrId string = ''
+param governanceProxyPrincipalId string = ''
 
 // Built-in role definition IDs
 var kvSecretsUserRoleId           = '4633458b-17de-408a-b874-0445c86b69e6' // Key Vault Secrets User
@@ -26,6 +28,7 @@ var searchServiceContribRoleId    = '7ca78c08-252a-4471-8644-bb5ff32d4ba0' // Se
 var storageBlobContribRoleId      = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe' // Storage Blob Data Contributor
 var cognitiveServicesOpenAiUserId = '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd' // Cognitive Services OpenAI User
 var cognitiveServicesUserRoleId   = 'a97b65f3-24c7-4388-baec-2e87135dc908' // Cognitive Services User
+var acrPullRoleId                 = '7f951dda-4ed3-4680-a7ca-43fe172d538d' // AcrPull
 
 // ── Container App → Key Vault Secrets User ───────────────────────────────────
 resource appKvRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
@@ -229,6 +232,19 @@ resource spStorageRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobContribRoleId)
     principalId: azureSpObjectId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// ── Governance Proxy → AcrPull (pulls its own image from ACR) ───────────────
+// Conditional — only created when both the ACR resource ID and the proxy's
+// principal ID are supplied (governance-proxy.bicep, deployed alongside).
+resource governanceProxyAcrPullRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(acrId) && !empty(governanceProxyPrincipalId)) {
+  name: guid(acrId, governanceProxyPrincipalId, acrPullRoleId)
+  scope: resourceGroup()
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
+    principalId: governanceProxyPrincipalId
     principalType: 'ServicePrincipal'
   }
 }

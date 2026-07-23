@@ -179,6 +179,10 @@ graph TB
             APIM["🔀 API Management\napim-{token}\nBasicV2 · Path: /mcp"]
         end
 
+        subgraph GOVPROXY["Governance Enforcement"]
+            PROXY["🛡 Governance Proxy\nca-govproxy-{token}\nEvaluates every tools/call\nagainst governance-policy.yaml"]
+        end
+
         subgraph MCP["MCP Server"]
             CA["📦 Container App\nca-mcp-{token}\nListens on / (NOT /mcp)"]
         end
@@ -197,7 +201,8 @@ graph TB
 
     PROJECT -->|"hosts"| AGENT
     AGENT -->|"Bearer: api://APIM_APP_ID"| APIM
-    APIM -->|"Bearer: api://MCP_APP_ID (OBO/CC)"| CA
+    APIM -->|"Bearer: api://MCP_APP_ID (OBO/CC), relayed unchanged"| PROXY
+    PROXY -->|"forward if ALLOW / deny if BLOCKED"| CA
     CA -->|"Key Vault Secrets User"| KV
     CA -->|"DocumentDB Account Contributor"| COSMOS
     CA -->|"Search Index Data Reader"| SEARCH
@@ -212,6 +217,7 @@ graph TB
     style RG fill:#f0f9f0,stroke:#107c10
     style AI_FOUNDRY fill:#fff4e6,stroke:#ff8c00
     style GATEWAY fill:#e6ffe6,stroke:#107c10
+    style GOVPROXY fill:#ffe6f0,stroke:#e3008c
     style MCP fill:#f9f0ff,stroke:#7a00e6
     style DATA fill:#e6f9ff,stroke:#00b7c3
     style INFRA fill:#fff0f0,stroke:#d83b01
@@ -379,6 +385,67 @@ showing policy-based allow/deny enforcement in front of the MCP tool calls
 above (`policies/governance-policy.yaml`, `demo_governance.py`, and
 `test_agent_mcp.py --governed`). See
 [`docs/governance-demo.md`](docs/governance-demo.md) for the full walkthrough.
+
+### Centralized enforcement: the Governance Proxy
+
+The standalone demo above only enforces policy for code paths that explicitly
+call `agentmesh.governance.govern()` — i.e. `demo_governance.py` and
+`test_agent_mcp.py --governed`. Any *other* caller (the Foundry Playground's
+native Tools catalog, a different script, a teammate's own client) would
+bypass it entirely, since nothing forces every caller through governed code.
+
+To close that gap, this repo also deploys a **governance proxy** — a small
+FastAPI service (`governance-proxy/app.py`) sitting between APIM and the real
+MCP Container App:
+
+```
+Foundry / any caller ──▶ APIM (auth + OBO/CC token exchange) ──▶ Governance Proxy ──▶ MCP Container App
+```
+
+APIM already validates the caller's token and exchanges it for a token scoped
+to the MCP CA app (`infra/apim-obo-policy.xml`) — the proxy trusts that and
+does **not** re-authenticate. Instead, for every `tools/call` JSON-RPC
+request it:
+
+1. Extracts the tool name + arguments and evaluates them against
+   `policies/governance-policy.yaml` (the exact same policy file the demo
+   scripts use — single source of truth).
+2. **Allowed** → relays the request unchanged (same headers, same backend
+   Authorization token) to the real MCP Container App.
+3. **Denied** → returns a JSON-RPC error immediately; the real MCP server is
+   never touched.
+
+Because APIM's backend now points at this proxy instead of the MCP Container
+App directly (`infra/modules/apim.bicep` → `mcpBackendUrl`), **every**
+documented calling path (Foundry Playground, `test_agent_mcp.py`, or any
+future client) is governed — not just calls that import `agentmesh.governance`
+themselves.
+
+`deploy.sh` builds and pushes the proxy's image to the deployment's ACR via
+`az acr build`, then swaps it into the already-deployed Container App with
+`az containerapp update` (the Bicep module deploys with a small placeholder
+image first, since the ACR doesn't exist until that same deployment creates
+it). Registry authentication for the private ACR is configured declaratively
+in `infra/modules/governance-proxy.bicep` (a `registries` block using the
+Container App's own system-assigned identity) — no manual
+`az containerapp registry set` step required. To roll back to transparent
+pass-through without redeploying, set `GOVERNANCE_ENABLED=false` on the
+`ca-govproxy-{token}` Container App.
+
+**Disabling the proxy entirely**: set `ENABLE_GOVERNANCE_PROXY=false` in
+`.env` before running `deploy.sh` (or pass `enableGovernanceProxy=false` to
+`az deployment sub create`). When disabled, `main.bicep` skips the proxy
+module altogether, APIM's backend points directly at the MCP Container App,
+and `deploy.sh` skips the image build/swap step — useful for environments
+that don't need centralized enforcement or want to avoid the extra hop/cost.
+Defaults to `true` (enabled).
+
+> [!NOTE]
+> **Known residual gap**: a caller with a valid Entra token for the MCP CA
+> app who calls the MCP Container App's own FQDN directly (bypassing APIM
+> and the proxy) still isn't governed. Closing that fully requires network
+> isolation — locking the MCP Container App to internal-only ingress with
+> APIM VNet-integrated to reach it — a larger change not yet implemented here.
 
 ---
 

@@ -44,6 +44,12 @@ param apimPublisherEmail string = 'admin@contoso.com'
 @description('Object ID of the Service Principal (run: az ad sp show --id <appId> --query id -o tsv). If provided, RBAC roles are assigned to the SP directly so the MCP server can authenticate with its credentials.')
 param azureSpObjectId string = ''
 
+@description('Governance proxy container image (owner/governance-proxy:tag from ACR). Defaults to a placeholder on first deploy — deploy.sh builds/pushes the real image and swaps it in via az containerapp update.')
+param governanceProxyImage string = 'mcr.microsoft.com/azuredocs/aci-helloworld:latest'
+
+@description('Set to false to skip the governance proxy entirely — APIM routes directly to the MCP Container App (no centralized policy enforcement). Defaults to true.')
+param enableGovernanceProxy bool = true
+
 // Built-in role IDs (subscription scope)
 var readerRoleId = 'acdd72a7-3385-48ef-bd42-f606fba81ae7' // Reader
 
@@ -179,10 +185,41 @@ module containerApps './modules/container-apps.bicep' = {
   }
 }
 
+// ── Governance Proxy ──────────────────────────────────────────────────────────
+// Sits between APIM and the real MCP Container App so AGT policy
+// (policies/governance-policy.yaml) applies to EVERY caller that reaches the
+// MCP server through APIM — not just calls made through this repo's local
+// Python demo scripts. See governance-proxy/ for the service source and
+// docs/governance-demo.md for the enforcement architecture.
+//
+// Deployed only when enableGovernanceProxy is true (default). When false,
+// APIM routes directly to the MCP Container App and no proxy resources are
+// created at all — useful for environments that don't need centralized
+// enforcement or want to avoid the extra hop/cost.
+module governanceProxy './modules/governance-proxy.bicep' = if (enableGovernanceProxy) {
+  name: 'governanceProxy'
+  scope: rg
+  params: {
+    location: location
+    resourceToken: resourceToken
+    tags: tags
+    containerAppsEnvId: containerApps.outputs.containerAppEnvId
+    mcpBackendUrl: 'https://${containerApps.outputs.containerAppFqdn}'
+    governanceProxyImage: governanceProxyImage
+    acrLoginServer: acr.outputs.acrLoginServer
+  }
+}
+
+// Governance proxy's own image-pull permission (RBAC role + registry auth
+// config) is granted via the roleAssignments module below and the
+// `registries` block baked into governance-proxy.bicep — both only apply
+// when the proxy is actually deployed.
+
 // ── API Management (MCP Gateway) ──────────────────────────────────────────────
-// APIM sits between AI Foundry and the MCP Container App.
-// It validates incoming Entra tokens and performs OBO/CC token exchange
-// so that the MCP CA receives a properly-scoped backend token.
+// APIM sits between AI Foundry and the backend. When the governance proxy is
+// enabled, it sits in front of the real MCP Container App and APIM routes to
+// it; the proxy relays the already-exchanged token through unchanged to the
+// MCP CA. When disabled, APIM routes directly to the MCP Container App.
 module apim './modules/apim.bicep' = {
   name: 'apim'
   scope: rg
@@ -195,7 +232,7 @@ module apim './modules/apim.bicep' = {
     apimGatewayAppId: apimGatewayAppId
     apimGatewayClientSecret: apimGatewayClientSecret
     mcpCaAppId: azureAdClientId
-    mcpBackendUrl: 'https://${containerApps.outputs.containerAppFqdn}'
+    mcpBackendUrl: enableGovernanceProxy ? 'https://${governanceProxy.outputs.containerAppFqdn}' : 'https://${containerApps.outputs.containerAppFqdn}'
   }
 }
 
@@ -226,12 +263,19 @@ module roleAssignments './modules/role-assignments.bicep' = {
     storageAccountId: storage.outputs.storageAccountId
     aiServicesId: aiServices.outputs.aiServicesId
     azureSpObjectId: azureSpObjectId
+    acrId: acr.outputs.acrId
+    governanceProxyPrincipalId: enableGovernanceProxy ? governanceProxy.outputs.containerAppPrincipalId : ''
   }
 }
 
 // ── Outputs ───────────────────────────────────────────────────────────────────
 output resourceGroupName string = rg.name
 output mcpServerUrl string = 'https://${containerApps.outputs.containerAppFqdn}'
+output governanceProxyEnabled bool = enableGovernanceProxy
+output governanceProxyName string = enableGovernanceProxy ? governanceProxy.outputs.containerAppName : ''
+output governanceProxyUrl string = enableGovernanceProxy ? 'https://${governanceProxy.outputs.containerAppFqdn}' : ''
+output acrLoginServer string = acr.outputs.acrLoginServer
+output acrName string = acr.outputs.acrName
 output apimGatewayUrl string = apim.outputs.apimGatewayUrl
 output keyVaultName string = keyVault.outputs.keyVaultName
 output cosmosEndpoint string = cosmosDb.outputs.cosmosEndpoint
