@@ -47,6 +47,7 @@ from azure.ai.agents.models import (
     RunStatus,
     RequiredMcpToolCall,
     RunStepMcpToolCall,
+    ToolApproval,
 )
 
 # Agent Governance Toolkit (AGT) — optional, opt-in governance layer.
@@ -90,14 +91,14 @@ FOUNDRY_ENDPOINT = (
 )
 
 # Agent config
-AGENT_NAME        = "azure-agent-helper"
-AGENT_MODEL       = "gpt-4.1"
+AGENT_NAME        = os.environ.get("AGENT_NAME", "azure-assitant")
+AGENT_MODEL       = os.environ.get("AGENT_MODEL", "gpt-4.1")
 AGENT_INSTRUCTIONS = (
     "You are a helpful Azure assistant. "
     "You have access to an Azure MCP server which can list and inspect Azure resources. "
     "Use MCP tools when the user asks about Azure resources, subscriptions, or services."
 )
-TEST_MESSAGE = "Using the MCP tools available to you, list the resource groups in the Azure subscription."
+TEST_MESSAGE = "Using the MCP tools available to you, list the resource groups in the Azure subscription under the tenant:  bf9dbca7-0b29-484e-b213-891ff18de01f and subscription: 276feb32-98b6-4602-90b0-4f5b72e60b35 ."
 
 # Governance (Agent Governance Toolkit demo — see docs/governance-demo.md).
 # Opt-in via --governed CLI flag (set in main()) or GOVERNANCE_ENABLED in .env.
@@ -292,13 +293,15 @@ def phase2_create_or_get_agent(agents_client: AgentsClient, token: str) -> str:
     print("PHASE 2: Create / reuse Foundry agent with APIM MCP tool")
     print("="*60)
 
-    # Delete existing agent so we can recreate with a fresh token in the header
+    # Delete existing agent so we can recreate with a fresh token in the header.
+    # NOTE: collect matches first, then delete — deleting while the paged
+    # `list_agents()` iterator is still active corrupts its continuation
+    # token and raises a spurious ResourceNotFoundError on the next page.
     print(f"\n  Looking for existing agent '{AGENT_NAME}'...")
-    agents = agents_client.list_agents()
-    for agent in agents:
-        if agent.name == AGENT_NAME:
-            print(f"  🗑  Deleting stale agent {agent.id} (token refresh)")
-            agents_client.delete_agent(agent.id)
+    stale_agent_ids = [agent.id for agent in agents_client.list_agents() if agent.name == AGENT_NAME]
+    for stale_id in stale_agent_ids:
+        print(f"  🗑  Deleting stale agent {stale_id} (token refresh)")
+        agents_client.delete_agent(stale_id)
 
     # Create the agent with MCP tool pointed at APIM, token in headers
     print(f"  Creating agent '{AGENT_NAME}' with fresh APIM Bearer token...")
@@ -369,21 +372,24 @@ def phase3_run_conversation(agents_client: AgentsClient, agent_id: str, credenti
 
         if run.status == RunStatus.REQUIRES_ACTION:
             # Handle MCP tool approval if required
-            required_actions = run.required_action.submit_tool_outputs.tool_calls
-            tool_outputs = []
+            required_actions = run.required_action.submit_tool_approval.tool_calls
+            tool_approvals = []
             for tool_call in required_actions:
                 if isinstance(tool_call, RequiredMcpToolCall):
-                    print(f"  ⚙️  MCP approval needed: {tool_call.function.name}")
+                    print(f"  ⚙️  MCP approval needed: {tool_call.name}")
                     # Auto-approve for testing
-                    tool_outputs.append({
-                        "tool_call_id": tool_call.id,
-                        "output": json.dumps({"approved": True})
-                    })
-            if tool_outputs:
+                    tool_approvals.append(
+                        ToolApproval(
+                            tool_call_id=tool_call.id,
+                            approve=True,
+                            headers={"Authorization": f"Bearer {token}"},
+                        )
+                    )
+            if tool_approvals:
                 run = agents_client.runs.submit_tool_outputs(
                     thread_id=thread.id,
                     run_id=run.id,
-                    tool_outputs=tool_outputs,
+                    tool_approvals=tool_approvals,
                 )
 
         time.sleep(2)
@@ -404,9 +410,9 @@ def phase3_run_conversation(agents_client: AgentsClient, agent_id: str, credenti
         if step.step_details and hasattr(step.step_details, 'tool_calls'):
             for tc in step.step_details.tool_calls:
                 if isinstance(tc, RunStepMcpToolCall):
-                    print(f"      🔧 MCP Tool: {tc.mcp.name}")
-                    print(f"         Input:  {json.dumps(tc.mcp.input, indent=10)[:200]}")
-                    output_preview = str(tc.mcp.output or '')[:200]
+                    print(f"      🔧 MCP Tool: {tc.name}")
+                    print(f"         Input:  {json.dumps(tc.arguments, indent=10)[:200]}")
+                    output_preview = str(tc.output or '')[:200]
                     print(f"         Output: {output_preview}")
 
     # Show final assistant message
