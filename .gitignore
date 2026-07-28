@@ -25,6 +25,10 @@ infra/main.json
 .github/agents/
 specs/
 
+# ── local test / traffic-generation scripts (not shipped) ────────────────────
+test_agent_mcp.py
+traffic_gen.py
+
 # ── venv ────────────────────────────────────────────────────────────────────────────
 venv/
 .venv-governance/
