@@ -20,9 +20,9 @@ infra/main.json
 
 # ── specific IDEs ───────────────────────────────────────────────────────────────
 .specify/
-github/workflows/.specify/
-github/prompts
-github/agents
+.github/workflows/.specify/
+.github/prompts/
+.github/agents/
 specs/
 
 # ── venv ────────────────────────────────────────────────────────────────────────────
