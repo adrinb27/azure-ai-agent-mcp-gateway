@@ -18,6 +18,16 @@ infra/main.json
 .deploy-*.txt
 .validation-proof.log
 
+# ── specific IDEs ───────────────────────────────────────────────────────────────
+.specify/
+github/workflows/.specify/
+github/prompts
+github/agents
+
+# ── venv ────────────────────────────────────────────────────────────────────────────
+venv/
+.venv-governance/
+
 # ── Node ──────────────────────────────────────────────────────────────────────
 node_modules/
 
