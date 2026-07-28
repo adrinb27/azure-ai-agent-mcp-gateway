@@ -1,0 +1,86 @@
+# policies/governance-policy.yaml
+#
+# Agent Governance Toolkit (AGT) demo policy for this repo.
+# Schema: https://github.com/microsoft/agent-governance-toolkit (apiVersion: governance.toolkit/v1)
+#
+# Shared by BOTH demo surfaces:
+#   - demo_governance.py            (standalone, no Azure deployment required)
+#   - test_agent_mcp.py --governed  (real Foundry Agent -> APIM -> Azure MCP flow)
+#
+# Philosophy: default-allow, deny-by-exception. Every Azure MCP tool call is
+# allowed unless it matches a destructive action pattern below. This lets a
+# presenter show that safe/read actions (e.g. listing resource groups) flow
+# through untouched, while destructive actions (delete/drop/truncate) are
+# blocked *before* they ever reach Azure/APIM.
+
+apiVersion: governance.toolkit/v1
+name: azure-mcp-demo-policy
+version: "1.0"
+default_action: allow
+
+rules:
+  # Generic/synthetic action names used by the standalone local demos
+  # (demo_governance.py, test_agent_mcp.py --governed) which call govern()
+  # directly with hand-picked action.type strings rather than real Azure MCP
+  # tool names.
+  - name: block-destructive-azure-actions
+    condition: "action.type in ['delete_resource_group', 'drop', 'delete', 'truncate']"
+    action: deny
+    description: "Destructive Azure operations are blocked in this demo"
+    priority: 100
+
+  # Real Azure MCP server tool names (verified against the live tool catalog —
+  # see `tools/list` on the deployed MCP server). NOTE: this MCP server does
+  # NOT expose a dedicated "delete resource group" tool — asking an agent to
+  # "delete a resource group" typically results in it calling
+  # arm_create_or_update_resource_group instead (see the tag-based rule
+  # below). This rule blocks the *real* destructive tools that do exist:
+  # VM/disk/database/queue/etc. deletion across the services this MCP server
+  # covers, so a Foundry Playground prompt like "delete the VM named X" or
+  # "delete the SQL database Y" reliably triggers a DENY via this proxy.
+  - name: block-real-mcp-delete-tools
+    condition: >-
+      action.type in [
+        'appconfig_kv_delete', 'compute_disk_delete', 'compute_vm_delete',
+        'compute_vmss_delete', 'eventhubs_eventhub_consumergroup_delete',
+        'eventhubs_eventhub_delete', 'eventhubs_namespace_delete',
+        'fileshares_fileshare_delete', 'fileshares_fileshare_snapshot_delete',
+        'foundry_agent_delete', 'foundry_continuous_eval_delete',
+        'foundry_data_generation_job_delete', 'foundry_evaluation_suite_delete',
+        'foundry_evaluation_suite_generation_job_delete',
+        'foundry_evaluator_catalog_delete', 'foundry_model_deployment_delete',
+        'foundry_project_connection_delete', 'foundry_session_delete',
+        'foundry_session_file_delete', 'managedlustre_fs_blob_autoexport_delete',
+        'managedlustre_fs_blob_autoimport_delete', 'managedlustre_fs_blob_import_delete',
+        'sql_db_delete', 'sql_server_delete', 'sql_server_firewall-rule_delete',
+        'sreagent_agents_delete', 'sreagent_commonprompts_delete',
+        'sreagent_connectors_delete', 'sreagent_docs_memories_delete',
+        'sreagent_hooks_delete', 'sreagent_scheduledtasks_delete',
+        'sreagent_skills_delete', 'sreagent_threads_delete',
+        'storagesync_cloudendpoint_delete', 'storagesync_serverendpoint_delete',
+        'storagesync_service_delete', 'storagesync_syncgroup_delete',
+        'workbooks_delete'
+      ]
+    action: deny
+    description: "Real Azure MCP server delete tools are blocked in this demo"
+    priority: 100
+
+  # Blocks ALL calls to arm_create_or_update_resource_group unconditionally.
+  #
+  # Why unconditional (not tag-based): since this MCP server exposes no real
+  # "delete resource group" tool, models asked to "delete a resource group"
+  # fall back to calling this tool with a tag signaling delete intent — but
+  # the exact tag key/value varies by model run (observed both
+  # {"deleteRequested":"true"} and {"delete":"true"} for the same prompt).
+  # AGT's condition DSL only supports fixed dot-path equality (no "any key in
+  # this dict" or wildcard matching), so trying to enumerate every possible
+  # tag spelling is unwinnable whack-a-mole. Blocking the tool itself is the
+  # only reliable way to guarantee the Foundry Playground deny-test always
+  # triggers, and this demo has no legitimate need to create/mutate resource
+  # groups via agent-driven MCP calls anyway (infra here is deployed via
+  # Bicep directly, not through the agent).
+  - name: block-resource-group-mutation
+    condition: "action.type == 'arm_create_or_update_resource_group'"
+    action: deny
+    description: "arm_create_or_update_resource_group is blocked in this demo (covers both legitimate create/update and the delete-via-tag workaround, since tag spelling is model-dependent and unenumerable)"
+    priority: 100

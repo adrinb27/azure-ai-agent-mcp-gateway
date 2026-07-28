@@ -1,0 +1,14 @@
+# requirements-governance.txt
+#
+# Dependency for the Agent Governance Toolkit (AGT) demo.
+# See docs/governance-demo.md for what this adds and how to run the demo.
+#
+# Requires Python 3.11+ (agentmesh-platform, an AGT sub-dependency, requires
+# >=3.11). If your default `python3`/`pip` resolve to an older interpreter,
+# create a 3.11+ venv first, e.g.:
+#   uv venv --python 3.11 .venv-governance && source .venv-governance/bin/activate
+#   uv pip install -r requirements-governance.txt
+# (plain `pip install -r requirements-governance.txt` also works once you're
+# running inside a 3.11+ interpreter/venv)
+
+agent-governance-toolkit[full]

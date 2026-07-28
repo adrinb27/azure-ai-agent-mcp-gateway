@@ -179,6 +179,10 @@ graph TB
             APIM["🔀 API Management\napim-{token}\nBasicV2 · Path: /mcp"]
         end
 
+        subgraph GOVPROXY["Governance Enforcement"]
+            PROXY["🛡 Governance Proxy\nca-govproxy-{token}\nEvaluates every tools/call\nagainst governance-policy.yaml"]
+        end
+
         subgraph MCP["MCP Server"]
             CA["📦 Container App\nca-mcp-{token}\nListens on / (NOT /mcp)"]
         end
@@ -197,7 +201,8 @@ graph TB
 
     PROJECT -->|"hosts"| AGENT
     AGENT -->|"Bearer: api://APIM_APP_ID"| APIM
-    APIM -->|"Bearer: api://MCP_APP_ID (OBO/CC)"| CA
+    APIM -->|"Bearer: api://MCP_APP_ID (OBO/CC), relayed unchanged"| PROXY
+    PROXY -->|"forward if ALLOW / deny if BLOCKED"| CA
     CA -->|"Key Vault Secrets User"| KV
     CA -->|"DocumentDB Account Contributor"| COSMOS
     CA -->|"Search Index Data Reader"| SEARCH
@@ -212,6 +217,7 @@ graph TB
     style RG fill:#f0f9f0,stroke:#107c10
     style AI_FOUNDRY fill:#fff4e6,stroke:#ff8c00
     style GATEWAY fill:#e6ffe6,stroke:#107c10
+    style GOVPROXY fill:#ffe6f0,stroke:#e3008c
     style MCP fill:#f9f0ff,stroke:#7a00e6
     style DATA fill:#e6f9ff,stroke:#00b7c3
     style INFRA fill:#fff0f0,stroke:#d83b01
@@ -371,6 +377,78 @@ python3 test_agent_mcp.py --phase 3   # Run agent conversation
 
 ---
 
+## Governance Demo
+
+This repo includes a lightweight demo of Microsoft's open-source
+[Agent Governance Toolkit](https://github.com/microsoft/agent-governance-toolkit),
+showing policy-based allow/deny enforcement in front of the MCP tool calls
+above (`policies/governance-policy.yaml`, `demo_governance.py`, and
+`test_agent_mcp.py --governed`). See
+[`docs/governance-demo.md`](docs/governance-demo.md) for the full walkthrough.
+
+### Centralized enforcement: the Governance Proxy
+
+The standalone demo above only enforces policy for code paths that explicitly
+call `agentmesh.governance.govern()` — i.e. `demo_governance.py` and
+`test_agent_mcp.py --governed`. Any *other* caller (the Foundry Playground's
+native Tools catalog, a different script, a teammate's own client) would
+bypass it entirely, since nothing forces every caller through governed code.
+
+To close that gap, this repo also deploys a **governance proxy** — a small
+FastAPI service (`governance-proxy/app.py`) sitting between APIM and the real
+MCP Container App:
+
+```
+Foundry / any caller ──▶ APIM (auth + OBO/CC token exchange) ──▶ Governance Proxy ──▶ MCP Container App
+```
+
+APIM already validates the caller's token and exchanges it for a token scoped
+to the MCP CA app (`infra/apim-obo-policy.xml`) — the proxy trusts that and
+does **not** re-authenticate. Instead, for every `tools/call` JSON-RPC
+request it:
+
+1. Extracts the tool name + arguments and evaluates them against
+   `policies/governance-policy.yaml` (the exact same policy file the demo
+   scripts use — single source of truth).
+2. **Allowed** → relays the request unchanged (same headers, same backend
+   Authorization token) to the real MCP Container App.
+3. **Denied** → returns a JSON-RPC error immediately; the real MCP server is
+   never touched.
+
+Because APIM's backend now points at this proxy instead of the MCP Container
+App directly (`infra/modules/apim.bicep` → `mcpBackendUrl`), **every**
+documented calling path (Foundry Playground, `test_agent_mcp.py`, or any
+future client) is governed — not just calls that import `agentmesh.governance`
+themselves.
+
+`deploy.sh` builds and pushes the proxy's image to the deployment's ACR via
+`az acr build`, then swaps it into the already-deployed Container App with
+`az containerapp update` (the Bicep module deploys with a small placeholder
+image first, since the ACR doesn't exist until that same deployment creates
+it). Registry authentication for the private ACR is configured declaratively
+in `infra/modules/governance-proxy.bicep` (a `registries` block using the
+Container App's own system-assigned identity) — no manual
+`az containerapp registry set` step required. To roll back to transparent
+pass-through without redeploying, set `GOVERNANCE_ENABLED=false` on the
+`ca-govproxy-{token}` Container App.
+
+**Disabling the proxy entirely**: set `ENABLE_GOVERNANCE_PROXY=false` in
+`.env` before running `deploy.sh` (or pass `enableGovernanceProxy=false` to
+`az deployment sub create`). When disabled, `main.bicep` skips the proxy
+module altogether, APIM's backend points directly at the MCP Container App,
+and `deploy.sh` skips the image build/swap step — useful for environments
+that don't need centralized enforcement or want to avoid the extra hop/cost.
+Defaults to `true` (enabled).
+
+> [!NOTE]
+> **Known residual gap**: a caller with a valid Entra token for the MCP CA
+> app who calls the MCP Container App's own FQDN directly (bypassing APIM
+> and the proxy) still isn't governed. Closing that fully requires network
+> isolation — locking the MCP Container App to internal-only ingress with
+> APIM VNet-integrated to reach it — a larger change not yet implemented here.
+
+---
+
 ## Troubleshooting
 
 ### HTTP 500 "Internal server error" from APIM
@@ -429,6 +507,14 @@ The backend token is valid but lacks the `Mcp.Tools.ReadWrite.All` role in the `
 Only `Microsoft.CognitiveServices/accounts/projects` resources appear in the new UI. The old `MachineLearningServices/workspaces` kind=Project does not.
 
 Both types are deployed by this Bicep. If you only see the old project, look for `agent-project` under the `aiss-{token}` AI Services account.
+
+### `tool_server_error` / HTTP 424 "Error retrieving tool list from MCP server" on agent run
+
+**Symptom**: `test_agent_mcp.py --governed` Phase 3 reaches `RunStatus.REQUIRES_ACTION` for the MCP tool, you approve it, then the run fails with `tool_server_error` / HTTP 424 (Failed Dependency), even though Phase 1's direct APIM call and the Container App's own logs show `tools/list` returning 200.
+
+**Root cause (seen in this repo)**: the run-level `tool_resources.mcp[].headers.Authorization` value (and/or the `ToolApproval.headers.Authorization` value used during approval) was not actually interpolating the bearer token — e.g. a stray string like `"Bearer ******"` instead of `f"Bearer {token}"`. Foundry's own MCP client then can't authenticate its second tool-list/tool-call round-trip through APIM, even though your Phase 1 test (a different, valid token) succeeded.
+
+**Fix**: Double-check that every `Authorization` header built for the run (`mcp_tool_resources` at agent-run creation and `ToolApproval(headers=...)` at approval time) contains the real token string, not a placeholder — print/log the header length or a token prefix while debugging, since accidentally hard-coding a literal string is easy to miss.
 
 ---
 
@@ -510,6 +596,70 @@ These are bugs discovered during real end-to-end deployments. All fixes are alre
 ```bicep
 output apimGatewayUrl string = apim.properties.gatewayUrl
 ```
+
+### 8. `.env` placeholder text isn't caught by `deploy.sh`'s `:?` checks
+
+**Symptom**: `deploy.sh --ci` succeeds, but the deployed Container App has `AzureAd__ClientId` literally set to the string `<mcp-ca-app-registration-client-id>` instead of a real GUID. Token validation then fails silently at the backend.
+
+**Root cause**: `deploy.sh` and `setup-obo-auth.sh` guard required variables with `: "${VAR:?message}"`, which only catches **unset or empty** variables — not variables that still contain literal placeholder text copied from `.env.example`. If `deploy.sh --ci` is run once before `MCP_APP_ID` (or `APIM_GATEWAY_APP_ID`) is populated, the placeholder gets baked into the Container App's env vars on the first pass and is never corrected on subsequent passes unless you re-run with `--set-env-vars` manually.
+
+**Fix**: Before running `./deploy.sh`, grep `.env` for any remaining `<...>` placeholder syntax:
+```bash
+grep -E '<[a-z-]+>' .env && echo "⚠️  Placeholder values still present in .env — fill these in first"
+```
+This check is not yet automated in `deploy.sh` itself — worth adding as a pre-flight step for anyone extending this repo.
+
+### 9. OBO (delegated) MCP calls need a permission **grant**, not just an app role assignment
+
+**Symptom**: APIM returns HTTP 502 — `APIM could not obtain a backend token for the MCP server` — even though `setup-obo-auth.sh` ran successfully and the APIM Gateway App SP already has `Mcp.Tools.ReadWrite.All` assigned on the MCP CA app.
+
+**Root cause**: The `jwt-bearer` (on-behalf-of) grant used by `apim-obo-policy.xml` requires the **client** (APIM Gateway app) to hold a **delegated permission grant** (`oauth2PermissionGrant` on the MCP CA app's `user_impersonation` scope, with admin consent) — this is separate from, and in addition to, any application **role assignment** the client SP has. `setup-obo-auth.sh` only configures the role assignment (which is sufficient for pure client-credentials/app-only calls), never the delegated grant, so the OBO/delegated-user path is non-functional out of the box.
+
+**Fix** (manual, not yet scripted):
+```bash
+# Add delegated permission + consent from APIM Gateway app to MCP CA app
+az ad app permission add --id <apim-gateway-app-id> \
+  --api <mcp-ca-app-id> --api-permissions <user_impersonation-scope-id>=Scope
+az ad app permission grant --id <apim-gateway-app-id> --api <mcp-ca-app-id> \
+  --scope user_impersonation
+az ad app permission admin-consent --id <apim-gateway-app-id>
+```
+Worth adding to `setup-obo-auth.sh` for future users — not yet patched into the script.
+
+### 10. OBO tokens carry the **signed-in user's** roles, not the client app's
+
+**Symptom**: After fixing #9, the 502 becomes a **403 Forbidden** at the MCP Container App.
+
+**Root cause**: Once the OBO exchange succeeds, the resulting token's `roles` claim reflects **the calling user's** app-role assignments on the resource — not the APIM Gateway app's own assignment (which only applies to app-only/client-credentials tokens). The signed-in user must separately hold `Mcp.Tools.ReadWrite.All` on the MCP CA app's service principal.
+
+**Fix**: Assign the role directly to the user via Graph:
+```bash
+az rest --method POST \
+  --uri "https://graph.microsoft.com/v1.0/servicePrincipals/<mcp-ca-sp-object-id>/appRoleAssignedTo" \
+  --body '{"principalId":"<user-object-id>","resourceId":"<mcp-ca-sp-object-id>","appRoleId":"<Mcp.Tools.ReadWrite.All-role-id>"}'
+```
+
+### 11. Foundry Assistants API returns MCP tool-call results via `submit_tool_approval`, not `submit_tool_outputs`
+
+**Symptom**: `test_agent_mcp.py` crashes with `AttributeError: 'RunRequiredAction' object has no attribute 'submit_tool_outputs'` (or similar) once the agent reaches `RunStatus.REQUIRES_ACTION` for an MCP tool.
+
+**Root cause**: `azure-ai-agents` uses different `RunRequiredAction` subtypes depending on tool type — function/code-interpreter tools use `SubmitToolOutputsAction` (`.submit_tool_outputs.tool_calls`), but **MCP tools use `SubmitToolApprovalAction`** (`.submit_tool_approval.tool_calls`, a list of `RequiredMcpToolCall` with `id`/`name`/`arguments`/`server_label` — no `.function` nesting). Submission still goes through `agents_client.runs.submit_tool_outputs(...)`, but with a `tool_approvals=[ToolApproval(tool_call_id=..., approve=True, headers={...})]` kwarg instead of `tool_outputs=[...]`.
+
+**Fix** (already applied in `test_agent_mcp.py`): read `run.required_action.submit_tool_approval.tool_calls`, build `ToolApproval` objects (with the APIM bearer token forwarded in `headers={"Authorization": f"Bearer {token}"}`), and pass them as `tool_approvals=` to `runs.submit_tool_outputs(...)`.
+
+### 12. Foundry portal "Project Managed Identity" tool auth fails with 401, even though the Foundry project's own role assignment is correct
+
+**Symptom**: A Tools-catalog MCP connection using Authentication = Microsoft Entra / Project Managed Identity works in Entra terms (project SP has `APIM.Access` on the APIM Gateway app, token audience/tenant/version all correct -- confirmed via a temporary APIM debug policy that echoed back the incoming token's claims), yet the Playground still fails with `401 Unauthorized` or `MCP Protocol Exception ... Request failed (remote)`.
+
+**Root cause**: The Foundry project's managed identity calls APIM with an **app-only** token (`sub == oid`). Per `apim-obo-policy.xml`'s branch logic, app-only tokens go through the **client-credentials** path -- APIM exchanges a token using **its own Gateway App identity** (`obo-client-id`/`obo-client-secret`), not the caller's. This means the Gateway App's own service principal -- not the Foundry project's SP -- must hold `Mcp.Tools.ReadWrite.All` on the MCP Container App. Having the *project's* SP correctly role-assigned is necessary but not sufficient; it's irrelevant to this code path.
+
+Separately, `.env`'s `APIM_GATEWAY_SP_OBJECT_ID` must stay in sync with the actual current Gateway App SP -- if it's ever left pointing at a stale/prior deployment's SP (e.g. after redeploying APIM or renaming resources), `setup-obo-auth.sh`'s Step 1 will silently assign the role to the wrong (old) service principal instead of the current one.
+
+**Fix**:
+1. Confirm/update `.env`'s `APIM_GATEWAY_APP_ID` and `APIM_GATEWAY_SP_OBJECT_ID` match the *currently deployed* APIM Gateway app (`az ad sp show --id <APIM_GATEWAY_APP_ID> --query id -o tsv`).
+2. Re-run `./setup-obo-auth.sh` -- it's idempotent and its Step 1 will assign `Mcp.Tools.ReadWrite.All` to the Gateway App SP on the MCP CA if missing.
+3. Verify directly: `az rest --method get --url "https://graph.microsoft.com/v1.0/servicePrincipals/<mcp-ca-sp-object-id>/appRoleAssignedTo"` should list the current Gateway App SP's `principalDisplayName`.
+4. Also watch for stray whitespace in `.env` values (e.g. `AGENT_NAME= foo` with a leading space) -- some scripts load `.env` via `xargs`/`export`, which breaks on values containing unquoted leading spaces, causing `export: 'foo': not a valid identifier` and silently aborting the rest of the script.
 
 ---
 

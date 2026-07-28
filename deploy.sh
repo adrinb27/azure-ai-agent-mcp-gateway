@@ -79,11 +79,24 @@ prompt_with_default APIM_PUBLISHER_EMAIL \
   "📧 APIM publisher email" \
   "$APIM_PUBLISHER_EMAIL"
 
+# 5. Governance proxy toggle — centralizes AGT policy enforcement between APIM
+# and the MCP Container App. Defaults to enabled; set to "false" in .env to
+# skip it entirely (APIM routes directly to the MCP Container App instead).
+ENABLE_GOVERNANCE_PROXY="${ENABLE_GOVERNANCE_PROXY:-true}"
+prompt_with_default ENABLE_GOVERNANCE_PROXY \
+  "🛡️  Enable governance proxy (centralized AGT policy enforcement)? [true/false]" \
+  "$ENABLE_GOVERNANCE_PROXY"
+
+# Normalize to lowercase true/false for the Bicep bool parameter.
+ENABLE_GOVERNANCE_PROXY=$(echo "${ENABLE_GOVERNANCE_PROXY}" | tr '[:upper:]' '[:lower:]')
+[[ "$ENABLE_GOVERNANCE_PROXY" != "true" && "$ENABLE_GOVERNANCE_PROXY" != "false" ]] && ENABLE_GOVERNANCE_PROXY="true"
+
 echo ""
 echo "────────────────────────────────────────────────────────────────────"
 echo "  Environment : $ENVIRONMENT_NAME"
 echo "  Resource RG : $RESOURCE_GROUP_NAME"
 echo "  Region      : $AZURE_LOCATION"
+echo "  Governance  : $([[ "$ENABLE_GOVERNANCE_PROXY" == "true" ]] && echo "enabled ✅" || echo "disabled")"
 echo "────────────────────────────────────────────────────────────────────"
 
 if ! $CI_MODE; then
@@ -213,6 +226,7 @@ DEPLOY_OUTPUT=$(az deployment sub create \
   --parameters apimGatewayAppId="$APIM_GATEWAY_APP_ID" \
   --parameters apimGatewayClientSecret="$APIM_GATEWAY_CLIENT_SECRET" \
   --parameters apimPublisherEmail="$APIM_PUBLISHER_EMAIL" \
+  --parameters enableGovernanceProxy="$ENABLE_GOVERNANCE_PROXY" \
   --output json)
 
 echo ""
@@ -224,6 +238,63 @@ echo "$DEPLOY_OUTPUT" | jq -r '
   to_entries[] |
   "  \(.key): \(.value.value)"
 '
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Build + push the real governance-proxy image, then swap it into the
+# Container App that was just deployed with a placeholder image. Only runs
+# when the governance proxy is enabled (ENABLE_GOVERNANCE_PROXY=true) — when
+# disabled, main.bicep skips the proxy module entirely, so there's nothing to
+# build or swap.
+#
+# This has to happen AFTER the Bicep deployment because the ACR (and the
+# governance-proxy Container App itself) don't exist until this deployment
+# creates them — classic chicken/egg, solved by deploying with a small public
+# placeholder image first (see infra/modules/governance-proxy.bicep).
+#
+# Registry authentication (so the Container App can actually pull from the
+# private ACR) is now configured declaratively in governance-proxy.bicep's
+# `registries` block, using the Container App's own system-assigned identity
+# — no separate `az containerapp registry set` step needed here anymore.
+#
+# IMPORTANT: each build is pushed with a UNIQUE tag (timestamp), not
+# ":latest". Azure Container Apps does not reliably roll a new revision when
+# `az containerapp update --image` is called with the SAME tag string as the
+# currently-running revision, even if the underlying image content changed —
+# it silently no-ops and keeps serving the old code. A unique tag per
+# deployment guarantees a real image change and a fresh revision every time.
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ "$ENABLE_GOVERNANCE_PROXY" == "true" ]]; then
+  ACR_NAME=$(echo "$DEPLOY_OUTPUT" | jq -r '.properties.outputs.acrName.value // ""')
+  GOV_PROXY_NAME=$(echo "$DEPLOY_OUTPUT" | jq -r '.properties.outputs.governanceProxyName.value // ""')
+  IMAGE_TAG="$(date +%Y%m%d%H%M%S)"
+
+  if [[ -n "$ACR_NAME" && -n "$GOV_PROXY_NAME" ]]; then
+    echo ""
+    echo "── Building governance-proxy image ──────────────────────────────────────"
+    echo "   Registry : $ACR_NAME"
+    echo "   Image    : governance-proxy:$IMAGE_TAG"
+    az acr build \
+      --registry "$ACR_NAME" \
+      --image "governance-proxy:$IMAGE_TAG" \
+      --file "governance-proxy/Dockerfile" \
+      .
+
+    echo ""
+    echo "── Deploying real image to the governance proxy Container App ──────────"
+    az containerapp update \
+      --name "$GOV_PROXY_NAME" \
+      --resource-group "$RESOURCE_GROUP_NAME" \
+      --image "${ACR_NAME}.azurecr.io/governance-proxy:$IMAGE_TAG" \
+      --output none
+    echo "   ✅  Governance proxy running the real image (tag: $IMAGE_TAG)."
+  else
+    echo "⚠️   Skipped governance-proxy image build (acrName/governanceProxyName missing from outputs)."
+  fi
+else
+  echo ""
+  echo "── Governance proxy disabled (ENABLE_GOVERNANCE_PROXY=false) ───────────"
+  echo "   Skipped image build/swap — APIM routes directly to the MCP Container App."
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Save deployment outputs back to .env
@@ -247,11 +318,13 @@ APIM_URL=$(echo "$DEPLOY_OUTPUT"     | jq -r '.properties.outputs.apimGatewayUrl
 NEW_PROJ_NAME=$(echo "$DEPLOY_OUTPUT" | jq -r '.properties.outputs.newFoundryProjectName.value // ""')
 NEW_PROJ_MI=$(echo "$DEPLOY_OUTPUT"   | jq -r '.properties.outputs.newFoundryProjectPrincipalId.value // ""')
 NEW_PROJ_EP=$(echo "$DEPLOY_OUTPUT"   | jq -r '.properties.outputs.newFoundryProjectEndpoint.value // ""')
+GOV_PROXY_URL=$(echo "$DEPLOY_OUTPUT" | jq -r '.properties.outputs.governanceProxyUrl.value // ""')
 
 save_env "ENVIRONMENT_NAME"                "$ENVIRONMENT_NAME"
 save_env "RESOURCE_GROUP_NAME"             "$RESOURCE_GROUP_NAME"
 save_env "AZURE_LOCATION"                  "$AZURE_LOCATION"
 save_env "APIM_PUBLISHER_EMAIL"            "$APIM_PUBLISHER_EMAIL"
+save_env "ENABLE_GOVERNANCE_PROXY"         "$ENABLE_GOVERNANCE_PROXY"
 save_env "APIM_GATEWAY_APP_ID"             "$APIM_GATEWAY_APP_ID"
 save_env "APIM_GATEWAY_SP_OBJECT_ID"       "${APIM_GATEWAY_SP_OBJECT_ID:-}"
 save_env "APIM_GATEWAY_CLIENT_SECRET"      "$APIM_GATEWAY_CLIENT_SECRET"
@@ -260,6 +333,8 @@ save_env "APIM_GATEWAY_URL"                "$APIM_URL"
 save_env "NEW_FOUNDRY_PROJECT_NAME"        "${NEW_PROJ_NAME:-}"
 save_env "FOUNDRY_PROJECT_MI_OBJECT_ID"    "${NEW_PROJ_MI:-}"
 save_env "NEW_FOUNDRY_PROJECT_ENDPOINT"    "${NEW_PROJ_EP:-}"
+save_env "GOVERNANCE_PROXY_NAME"           "${GOV_PROXY_NAME:-}"
+save_env "GOVERNANCE_PROXY_URL"            "${GOV_PROXY_URL:-}"
 
 echo "   ✅  .env updated"
 
