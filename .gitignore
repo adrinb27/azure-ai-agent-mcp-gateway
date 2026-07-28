@@ -23,7 +23,7 @@ infra/main.json
 github/workflows/.specify/
 github/prompts
 github/agents
-
+specs/
 # ── venv ────────────────────────────────────────────────────────────────────────────
 venv/
 .venv-governance/
